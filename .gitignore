@@ -1,0 +1,14 @@
+node_modules
+dist
+coverage
+.vscode
+*.log
+
+*.env
+*.env.local
+*.env.development
+*.env.test
+*.env.production
+
+# MacOS
+.DS_Store
