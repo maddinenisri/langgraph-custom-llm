@@ -50,40 +50,94 @@ function resolveWorkspacePath(relativePath: string): string | null {
 }
 
 // --- File System Tools Definitions ---
+async function recursiveListDir(
+  dirPath: string,
+  basePath: string, // The original requested path relative to workspace root
+  currentRelativePrefix: string // Path relative to the dirPath being processed
+): Promise<string[]> {
+  let entries = [];
+  try {
+    entries = await fs.readdir(dirPath, { withFileTypes: true });
+  } catch (error: any) {
+    console.error(`Error reading directory ${dirPath}:`, error);
+    // Return error marker for this specific directory
+    return [
+      `Error reading ${path.join(basePath, currentRelativePrefix)}: ${
+        error.message
+      }`,
+    ];
+  }
+
+  let fileList: string[] = [];
+
+  for (const dirent of entries) {
+    const entryName = dirent.name;
+    // Construct the path relative to the original requested directory 'basePath'
+    const relativePath = path.join(currentRelativePrefix, entryName);
+
+    if (dirent.isDirectory()) {
+      fileList.push(`${relativePath}/`); // Indicate directory
+      // Recurse into the subdirectory
+      const subDirFiles = await recursiveListDir(
+        path.join(dirPath, entryName),
+        basePath, // Keep passing the original base path
+        relativePath // Pass the updated relative prefix
+      );
+      fileList = fileList.concat(subDirFiles); // Add results from subdirectory
+    } else {
+      fileList.push(relativePath); // Add file path relative to basePath
+    }
+  }
+  return fileList;
+}
 
 const listFilesTool = tool(
   async ({ directoryPath = "." }: { directoryPath?: string }) => {
-    console.log(`--- Executing List Files Tool ---`);
-    let resolvedPath;
+    console.log(`--- Executing Recursive List Files Tool ---`);
+    const safeAbsolutePath = resolveWorkspacePath(directoryPath);
+    if (!safeAbsolutePath)
+      return "Error: Invalid or disallowed directory path.";
+
     try {
-      if (path.isAbsolute(directoryPath)) {
-        resolvedPath = directoryPath;
-      } else if (WORKSPACE_DIR) {
-        resolvedPath = path.join(WORKSPACE_DIR, directoryPath);
-      } else {
-        resolvedPath = path.resolve(directoryPath);
+      console.log(
+        `Recursively listing files starting from resolved path: ${safeAbsolutePath}`
+      );
+      // Start recursion from the resolved absolute path,
+      // using the original relative path for display/prefixing in results.
+      const recursiveFileList = await recursiveListDir(
+        safeAbsolutePath,
+        directoryPath,
+        ""
+      );
+
+      if (recursiveFileList.some((f) => f.startsWith("Error reading"))) {
+        // Report partial success if some directories failed
+        return `Partial file list in '${directoryPath}' (some directories failed):\n${recursiveFileList.join(
+          "\n"
+        )}`;
       }
 
-      console.log(`Listing files in resolved path: ${resolvedPath}`);
-      const files = await fs.readdir(resolvedPath, { withFileTypes: true });
-      const fileList = files.map(
-        (dirent) => `${dirent.name}${dirent.isDirectory() ? "/" : ""}`
-      );
-      return `Files in '${directoryPath}':\n${fileList.join("\n")}`;
+      return `Files and directories (recursively) in '${directoryPath}':\n${recursiveFileList.join(
+        "\n"
+      )}`;
     } catch (error: any) {
-      console.error(`Error listing files in ${resolvedPath}:`, error);
-      return `Error listing files: ${error.message}`;
+      // Catch errors from the initial directory read or setup
+      console.error(
+        `Error listing files recursively from ${safeAbsolutePath}:`,
+        error
+      );
+      return `Error listing files recursively: ${error.message}`;
     }
   },
   {
-    name: "list_files",
-    description: `Lists files and directories within a specified sub-directory of the workspace. Paths MUST be relative to the workspace root. Example: "." for root, "subfolder" for a subfolder..`,
+    name: "list_files_recursive", // Renamed for clarity
+    description: `Recursively lists all files and directories within a specified sub-directory of the workspace. Paths MUST be relative to the workspace root. Example: "." for root, "subfolder" for a subfolder. Do NOT use absolute paths or "..". Returns a list of paths relative to the requested directory.`,
     schema: z.object({
       directoryPath: z
         .string()
         .optional()
         .describe(
-          `Relative path to the directory within the workspace (e.g., ".", "documents", "data/images"). Defaults to workspace root (".").`
+          `Relative path to the starting directory within the workspace (e.g., ".", "documents", "data/images"). Defaults to workspace root (".").`
         ),
     }),
   }
@@ -92,17 +146,12 @@ const listFilesTool = tool(
 const readFileTool = tool(
   async ({ filePath }: { filePath: string }) => {
     console.log(`--- Executing Read File Tool ---`);
-    let resolvedPath;
+    const safePath = resolveWorkspacePath(filePath);
+    if (!safePath) return "Error: Invalid or disallowed file path.";
+
     try {
-      if (path.isAbsolute(filePath)) {
-        resolvedPath = filePath;
-      } else if (WORKSPACE_DIR) {
-        resolvedPath = path.join(WORKSPACE_DIR, filePath);
-      } else {
-        resolvedPath = path.resolve(filePath);
-      }
-      console.log(`Reading file from resolved path: ${resolvedPath}`);
-      const content = await fs.readFile(resolvedPath, "utf-8");
+      console.log(`Reading file from resolved path: ${safePath}`);
+      const content = await fs.readFile(safePath, "utf-8");
       // Consider adding limits for very large files
       if (content.length > 50000) {
         // Example limit: 50k chars
@@ -111,7 +160,7 @@ const readFileTool = tool(
       }
       return `File content of '${filePath}':\n${content}`;
     } catch (error: any) {
-      console.error(`Error reading file ${resolvedPath}:`, error);
+      console.error(`Error reading file ${safePath}:`, error);
       // Provide specific error messages
       if (error.code === "ENOENT") {
         return `Error: File not found at path '${filePath}'.`;
@@ -121,7 +170,7 @@ const readFileTool = tool(
   },
   {
     name: "read_file",
-    description: `Reads the content of a specified file within the workspace. Paths MUST be relative to the workspace root or absolute path. Example: "document.txt", "scripts/myscript.js".`,
+    description: `Reads the content of a specified file within the workspace. Paths MUST be relative to the workspace root. Example: "document.txt", "scripts/myscript.js". Do NOT use absolute paths or "..".`,
     schema: z.object({
       filePath: z
         .string()
@@ -135,31 +184,25 @@ const readFileTool = tool(
 const writeFileTool = tool(
   async ({ filePath, content }: { filePath: string; content: string }) => {
     console.log(`--- Executing Write File Tool ---`);
-    let resolvedPath;
+    const safePath = resolveWorkspacePath(filePath);
+    if (!safePath) return "Error: Invalid or disallowed file path.";
 
     try {
-      if (path.isAbsolute(filePath)) {
-        resolvedPath = filePath;
-      } else if (WORKSPACE_DIR) {
-        resolvedPath = path.join(WORKSPACE_DIR, filePath);
-      } else {
-        resolvedPath = path.resolve(filePath);
-      }
       // Ensure the directory exists before writing
-      const dirName = path.dirname(resolvedPath);
+      const dirName = path.dirname(safePath);
       await fs.mkdir(dirName, { recursive: true });
 
-      console.log(`Writing content to resolved path: ${resolvedPath}`);
-      await fs.writeFile(resolvedPath, content, "utf-8");
+      console.log(`Writing content to resolved path: ${safePath}`);
+      await fs.writeFile(safePath, content, "utf-8");
       return `Successfully wrote content to file '${filePath}'.`;
     } catch (error: any) {
-      console.error(`Error writing file ${resolvedPath}:`, error);
+      console.error(`Error writing file ${safePath}:`, error);
       return `Error writing file: ${error.message}`;
     }
   },
   {
     name: "write_file",
-    description: `Writes content to a specified file within the workspace. Creates directories if they don't exist. Overwrites the file if it already exists. Paths MUST be relative to the workspace root. Example: "output.log", "results/data.json"..`,
+    description: `Writes content to a specified file within the workspace. Creates directories if they don't exist. Overwrites the file if it already exists. Paths MUST be relative to the workspace root. Example: "output.log", "results/data.json". Do NOT use absolute paths or "..".`,
     schema: z.object({
       filePath: z
         .string()
@@ -233,21 +276,18 @@ const calculatorTool = tool(
 );
 
 // Export the standard tools array with a more flexible type
-export const standardTools: any[] = [
-  searchTool,
-  calculatorTool,
-  listFilesTool,
-  readFileTool,
-  writeFileTool,
-];
+export const standardTools: any[] = [searchTool, calculatorTool];
 
 // Conditionally add file tools if WORKSPACE_DIR is set
-// if (WORKSPACE_DIR) {
-//     standardTools.push(listFilesTool, readFileTool, writeFileTool);
-//     console.log("File system tools (list_files, read_file, write_file) enabled for workspace:", WORKSPACE_DIR);
-// } else {
-//     console.log("File system tools disabled (WORKSPACE_DIR not set).");
-// }
+if (WORKSPACE_DIR) {
+  standardTools.push(listFilesTool, readFileTool, writeFileTool);
+  console.log(
+    "File system tools (list_files, read_file, write_file) enabled for workspace:",
+    WORKSPACE_DIR
+  );
+} else {
+  console.log("File system tools disabled (WORKSPACE_DIR not set).");
+}
 // Add JIRA tool instantiation here when ready
 // if (process.env.JIRA_URL && ...) {
 //    const jiraTool = new JiraTool({...});
