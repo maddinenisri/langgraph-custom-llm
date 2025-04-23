@@ -1,190 +1,581 @@
 // src/llm_client/LLMGatewayClient.ts
-import { v4 as uuidv4 } from 'uuid';
-import fetch, { Response } from 'node-fetch';
-// Use global AbortController
+import {
+  BaseChatModel,
+  type BaseChatModelParams,
+  type BaseChatModelCallOptions,
+  type BindToolsInput,
+} from "@langchain/core/language_models/chat_models";
+import { type BaseLanguageModelInput } from "@langchain/core/language_models/base";
+import {
+  AIMessage,
+  AIMessageChunk,
+  BaseMessage,
+  HumanMessage,
+  SystemMessage,
+  ToolMessage,
+} from "@langchain/core/messages";
+import { ChatResult, ChatGenerationChunk } from "@langchain/core/outputs";
+import { CallbackManagerForLLMRun } from "@langchain/core/callbacks/manager";
+import { v4 as uuidv4 } from "uuid";
+import fetch, { Response } from "node-fetch";
+import { type ToolCall } from "@langchain/core/messages/tool";
+// Import necessary types for bindTools
+import type { StructuredToolInterface } from "@langchain/core/tools";
+import type { Runnable } from "@langchain/core/runnables";
+import { ZodType, ZodTypeDef } from "zod";
 
-// Define interfaces (keep these as they are)
-interface TextEventPayload { type: 'text'; text: string; }
-interface UsageEventPayload { type: 'usage'; usage: { inputTokens: number; outputTokens: number; }; }
-type LLMGatewayEventData = TextEventPayload | UsageEventPayload | '[DONE]';
-export interface LLMStreamEvent { type: 'text' | 'usage' | 'done' | 'error'; data: any; }
-export interface LLMGatewayClientOptions { systemPrompt?: string; threadId?: string; parameters?: { temperature?: number; max_tokens?: number; }; signal?: AbortSignal; }
+// Define StructuredOutputMethodOptions type
+interface StructuredOutputMethodOptions<T extends boolean = boolean> {
+  name?: string;
+  method?: "functionCalling" | "jsonMode";
+  includeRaw?: T;
+  strict?: boolean;
+}
+import { convertToOpenAITool } from "@langchain/core/utils/function_calling";
 
-export class LLMGatewayClient {
+// Define internal event types
+interface TextEventPayload {
+  type: "text";
+  text: string;
+}
+interface UsageEventPayload {
+  type: "usage";
+  usage: { inputTokens: number; outputTokens: number };
+}
+type LLMGatewayRawEventData = TextEventPayload | UsageEventPayload; // Remove '[DONE]' from type for easier guarding
+
+// Interface for Constructor Options, extending BaseChatModelParams
+export interface LLMGatewayClientParams extends BaseChatModelParams {
+  apiUrl: string;
+  apiKey: string;
+  defaultThreadId?: string;
+  defaultSystemPrompt?: string;
+  defaultTemperature?: number;
+  defaultMaxTokens?: number;
+}
+
+export class LLMGatewayClient extends BaseChatModel {
   private readonly apiUrl: string;
   private readonly apiKey: string;
-  private readonly defaultThreadId: string;
-  private readonly defaultTemperature: number = 0.2;
-  private readonly defaultMaxTokens: number = 8000;
+  private readonly defaultThreadId?: string;
+  private readonly defaultSystemPrompt?: string;
+  private readonly defaultTemperature: number;
+  private readonly defaultMaxTokens: number;
 
-  constructor(apiUrl: string, apiKey: string, defaultThreadId?: string) {
-    if (!apiUrl || !apiKey) {
-      throw new Error("API URL and API Key are required for LLMGatewayClient.");
-    }
-    this.apiUrl = apiUrl;
-    this.apiKey = apiKey;
-    this.defaultThreadId = defaultThreadId ?? uuidv4();
-    console.debug(`LLMGatewayClient initialized. API URL: ${this.apiUrl}, Default Thread ID: ${this.defaultThreadId}`);
+  static _llmType(): string {
+    return "llm-gateway";
+  }
+  _llmType(): string {
+    return "llm-gateway";
   }
 
-  // formatRequest remains the same
-  private formatRequest(query: string, options: LLMGatewayClientOptions): object {
-    const threadId = options.threadId || this.defaultThreadId;
-    const temperature = options.parameters?.temperature ?? this.defaultTemperature;
-    const maxTokens = options.parameters?.max_tokens ?? this.defaultMaxTokens;
-    const messages: { role: string; content: string }[] = [];
-    if (options.systemPrompt) {
-      messages.push({ role: 'user', content: options.systemPrompt });
+  constructor(fields: LLMGatewayClientParams) {
+    super(fields);
+    if (!fields.apiUrl || !fields.apiKey)
+      throw new Error("API URL and API Key required.");
+    this.apiUrl = fields.apiUrl;
+    this.apiKey = fields.apiKey;
+    this.defaultThreadId = fields.defaultThreadId;
+    this.defaultSystemPrompt = fields.defaultSystemPrompt;
+    this.defaultTemperature = fields.defaultTemperature ?? 0.2;
+    this.defaultMaxTokens = fields.defaultMaxTokens ?? 8000;
+    console.debug(
+      `LLMGatewayClient (BaseChatModel) initialized. API URL: ${this.apiUrl}`
+    );
+  }
+
+  /** Formats LangChain messages for the Gateway API */
+  private formatGatewayMessages(
+    messages: BaseMessage[]
+  ): Array<{ role: string; content: string }> {
+    const systemPromptMessage =
+      this.defaultSystemPrompt &&
+      !messages.some((m) => m._getType() === "system")
+        ? [new SystemMessage(this.defaultSystemPrompt)]
+        : [];
+
+    const allMessages = [...systemPromptMessage, ...messages];
+
+    // First map messages to their gateway format
+    const formattedMessages = allMessages.map((msg) => {
+      const type = msg._getType();
+      switch (type) {
+        case "system":
+          return { role: "system", content: msg.content as string };
+        case "human":
+          return { role: "user", content: msg.content as string };
+        case "ai":
+          return { role: "assistant", content: msg.content as string };
+        case "tool":
+          return {
+            role: "user", // **ADJUST based on your gateway's expectation**
+            content: `Tool Result [${(msg as ToolMessage).tool_call_id}]:\n${
+              msg.content as string
+            }`,
+          };
+        default:
+          console.warn(
+            `Unhandled message type in formatGatewayMessages: ${type}`
+          );
+          return { role: "user", content: msg.content as string };
+      }
+    });
+    
+    // Filter out empty assistant messages except for the last one
+    // This prevents the validation error from the LLM Gateway
+    const filteredMessages = formattedMessages.filter((msg, index, array) => {
+      // Keep all non-assistant messages
+      if (msg.role !== "assistant") return true;
+      
+      // Keep assistant messages with content
+      if (msg.content && msg.content.trim() !== "") return true;
+      
+      // Keep the last assistant message even if empty (allowed by the API)
+      if (index === array.length - 1) return true;
+      
+      // Filter out empty assistant messages that aren't the last one
+      console.debug(`>>> [LLMGatewayClient DEBUG] Filtering out empty assistant message at index ${index}`);
+      return false;
+    });
+    
+    return filteredMessages;
+  }
+
+  /** Parses aggregated text response for tool calls */
+  private parseToolCalls(responseText: string): {
+    textResponse: string;
+    toolCalls?: ToolCall[];
+  } {
+    // ...(same as previous version)...
+    const toolCalls: ToolCall[] = [];
+    let finalResponseText = responseText;
+    try {
+      const jsonMatch = responseText.match(
+        /```json\s*([\s\S]+?)\s*```|^\s*(\{[\s\S]+\})\s*$/m
+      );
+      if (jsonMatch) {
+        const jsonString = (jsonMatch[1] ?? jsonMatch[2])?.trim();
+        if (jsonString) {
+          const parsedJson = JSON.parse(jsonString);
+          const processCall = (call: any) => {
+            if (call.tool_name && call.tool_input !== undefined) {
+              console.log(`Detected tool call via JSON: ${call.tool_name}`);
+              toolCalls.push({
+                name: call.tool_name,
+                args: call.tool_input,
+                id: `tool_${uuidv4()}`,
+              });
+            }
+          };
+          if (Array.isArray(parsedJson)) {
+            parsedJson.forEach(processCall);
+          } else if (typeof parsedJson === "object" && parsedJson !== null) {
+            processCall(parsedJson);
+          }
+          if (toolCalls.length > 0) {
+            finalResponseText = "";
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Tool call JSON parsing failed.", e);
+      finalResponseText = responseText;
     }
-    messages.push({ role: 'user', content: query });
-    const requestBody = {
-      messages: messages,
-      parameters: { temperature: temperature, max_tokens: maxTokens, },
-      threadId: threadId,
+    return {
+      textResponse: finalResponseText.trim(),
+      toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
     };
-    console.debug(`Formatted Request (Thread ID: ${threadId}):`, JSON.stringify(requestBody, null, 2));
-    return requestBody;
   }
 
+  /** Core method: Calls the LLM Gateway API */
+  async _generate(
+    messages: BaseMessage[],
+    options: this["ParsedCallOptions"],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<ChatResult> {
+    console.debug(">>> [LLMGatewayClient DEBUG] Entering _generate..."); // Log entry
+    const stream = this._streamResponseChunks(messages, options, runManager);
+    let aggregatedText = "";
+    let usageData: any = null;
+    let lastChunk: ChatGenerationChunk | undefined;
 
-  public async *callLLMStream(query: string, options: LLMGatewayClientOptions = {}): AsyncGenerator<LLMStreamEvent, void, undefined> {
-    const requestBody = this.formatRequest(query, options);
+    for await (const chunk of stream) {
+      aggregatedText += chunk.text;
+      if (chunk.generationInfo?.usage) {
+        usageData = chunk.generationInfo.usage;
+      }
+      lastChunk = chunk;
+    }
+    console.debug(
+      `>>> [LLMGatewayClient DEBUG] _generate: Stream finished. Aggregated Text Length: ${aggregatedText.length}`
+    ); // Log stream finish
+
+    if (!lastChunk && !aggregatedText) {
+      console.warn(
+        ">>> [LLMGatewayClient WARN] _generate: LLM stream returned no content."
+      );
+      // Return empty message
+      const emptyResult: ChatResult = {
+        generations: [{ text: "", message: new AIMessage("") }],
+        llmOutput: { usage: usageData },
+      };
+      console.debug(
+        ">>> [LLMGatewayClient DEBUG] _generate: Returning empty result:",
+        JSON.stringify(emptyResult)
+      ); // Log result
+      return emptyResult;
+    }
+
+    const { textResponse, toolCalls } = this.parseToolCalls(aggregatedText);
+    console.debug(
+      `>>> [LLMGatewayClient DEBUG] _generate: Parsed response - Text: "${textResponse.substring(
+        0,
+        100
+      )}...", Tool Calls:`,
+      toolCalls
+    ); // Log parsed result
+
+    const finalMessage = new AIMessage({
+      content: textResponse,
+      tool_calls: toolCalls,
+      additional_kwargs: {
+        ...(usageData ? { usage: usageData } : {}),
+      },
+    });
+
+    const result: ChatResult = {
+      generations: [
+        {
+          text: aggregatedText, // Keep full original text
+          message: finalMessage,
+          generationInfo: lastChunk?.generationInfo ?? {},
+        },
+      ],
+      llmOutput: { usage: usageData },
+    };
+
+    // *** ADDED LOG: Log the final result being returned by _generate ***
+    console.debug(
+      ">>> [LLMGatewayClient DEBUG] _generate: Returning ChatResult:",
+      JSON.stringify(result, null, 2)
+    );
+    // *********************************************************************
+
+    return result;
+  }
+
+  /** Handles streaming responses */
+  async *_streamResponseChunks(
+    messages: BaseMessage[],
+    options: this["ParsedCallOptions"],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    // Format messages for the gateway
+    const gatewayMessages = this.formatGatewayMessages(messages);
+    
+    // Log the original and formatted messages for debugging
+    console.debug(">>> [LLMGatewayClient DEBUG] Original messages count:", messages.length);
+    console.debug(">>> [LLMGatewayClient DEBUG] Formatted messages count:", gatewayMessages.length);
+    console.debug(">>> [LLMGatewayClient DEBUG] Formatted messages:",
+      JSON.stringify(gatewayMessages.map(m => ({role: m.role, contentLength: m.content?.length || 0})))
+    );
+    
+    const temperature = this.defaultTemperature;
+    const maxTokens = this.defaultMaxTokens;
+    const stopSequences = options.stop;
+    // Use the default threadId instead of trying to access it from options.configurable
+    const threadId = this.defaultThreadId ?? uuidv4(); // Generate a new UUID if not provided
+    // Make threadId optional since we're using the default
+    // if (!threadId || typeof threadId !== 'string' || threadId.trim().length === 0) {
+    //   throw new Error("LLM Gateway request requires a valid thread_id in invocation config.");
+    // }
+    const requestBody: Record<string, any> = {
+      messages: gatewayMessages,
+      parameters: {
+        temperature,
+        max_tokens: maxTokens,
+        ...(stopSequences && { stop: stopSequences }),
+      },
+      ...(threadId && { threadId: threadId }),
+    };
     const headers = {
-      'Content-Type': 'application/json',
-      'token': this.apiKey,
-      'Accept': 'text/event-stream',
+      "Content-Type": "application/json",
+      token: this.apiKey,
+      Accept: "text/event-stream",
     };
-
     const abortController = new AbortController();
-    const signal = options.signal ? this.abortSignalAny([options.signal, abortController.signal]) : abortController.signal;
+    const signal = options.signal
+      ? this.abortSignalAny([options.signal, abortController.signal])
+      : abortController.signal;
 
     let response: Response | null = null;
-    // *** Move declaration here ***
     let streamCancelled = false;
 
     try {
+      console.debug(
+        ">>> [LLMGatewayClient DEBUG] Sending request to LLM Gateway:",
+        JSON.stringify(requestBody)
+      ); // Existing log
       response = await fetch(this.apiUrl, {
-        method: 'POST',
-        headers: headers,
+        method: "POST",
+        headers,
         body: JSON.stringify(requestBody),
-        signal: signal,
+        signal,
       });
+      console.debug(
+        `>>> [LLMGatewayClient DEBUG] Fetch response received. Status: ${response.status}, OK: ${response.ok}`
+      ); // *** ADDED LOG ***
 
       if (!response.ok) {
-        let errorBody = 'Unknown error';
-        try { errorBody = await response.text(); } catch { /* Ignore */ }
-        throw new Error(`LLM Gateway API Error: Status ${response.status}. Body: ${errorBody}`);
+        const errorBody = await response
+          .text()
+          .catch(() => "Failed to read error body");
+        console.error(
+          `>>> [LLMGatewayClient ERROR] Fetch failed. Status: ${response.status}, Body: ${errorBody}`
+        ); // *** ADDED LOG ***
+        throw new Error(
+          `LLM Gateway API Error: Status ${response.status}. Body: ${errorBody}`
+        );
       }
-
-      const contentType = response.headers.get('content-type');
-      if (!contentType?.includes('text/event-stream')) {
-        throw new Error(`Expected text/event-stream, but received ${contentType}`);
-      }
-
       if (!response.body) {
-         throw new Error("Response body is null.");
+        console.error(`>>> [LLMGatewayClient ERROR] Response body is null.`); // *** ADDED LOG ***
+        throw new Error("Response body is null.");
       }
 
       const decoder = new TextDecoder();
-      let buffer = '';
-      // Moved streamCancelled declaration before try block
+      let buffer = "";
+      let usageData: any = null;
+
+      console.debug(
+        ">>> [LLMGatewayClient DEBUG] Starting to process SSE stream..."
+      ); // *** ADDED LOG ***
+      let chunkCounter = 0; // *** ADDED Counter ***
 
       for await (const chunk of response.body as any as AsyncIterable<Buffer>) {
-         if (streamCancelled) break;
+        chunkCounter++; // *** INCREMENT Counter ***
+        console.debug(
+          `>>> [LLMGatewayClient DEBUG] Received raw chunk ${chunkCounter} (size: ${chunk?.byteLength}).`
+        ); // *** ADDED LOG ***
+        if (streamCancelled) {
+          console.debug(
+            `>>> [LLMGatewayClient DEBUG] Stream cancelled, breaking chunk loop.`
+          ); // *** ADDED LOG ***
+          break;
+        }
 
-         buffer += decoder.decode(chunk, { stream: true });
+        buffer += decoder.decode(chunk, { stream: true });
+        console.debug(
+          `>>> [LLMGatewayClient DEBUG] Current buffer (partial): "${buffer
+            .replace(/\n/g, "\\n")
+            .substring(0, 200)}..."`
+        ); // *** ADDED LOG ***
 
-         let boundaryIndex;
-         while ((boundaryIndex = buffer.indexOf('\n\n')) >= 0) {
-            if (streamCancelled) break;
-            const message = buffer.substring(0, boundaryIndex);
-            buffer = buffer.substring(boundaryIndex + 2);
+        let boundaryIndex;
+        while ((boundaryIndex = buffer.indexOf("\n\n")) >= 0) {
+          console.debug(
+            `>>> [LLMGatewayClient DEBUG] Found message boundary at index ${boundaryIndex}.`
+          ); // *** ADDED LOG ***
+          if (streamCancelled) break;
+          const message = buffer.substring(0, boundaryIndex);
+          buffer = buffer.substring(boundaryIndex + 2);
+          if (!message.trim()) {
+            console.debug(
+              ">>> [LLMGatewayClient DEBUG] Skipping empty message block."
+            ); // *** ADDED LOG ***
+            continue;
+          }
 
-            if (!message.trim()) continue;
-
-            const lines = message.split('\n');
-            for (const line of lines) {
-              if (line.startsWith('data:')) {
-                  const data = line.substring(5).trim();
-                  if (data === '[DONE]') {
-                    console.info("SSE Stream [DONE] received.");
-                    yield { type: 'done', data: null };
-                    streamCancelled = true; // Set flag
-                    if (!signal.aborted) {
-                         abortController.abort(); // Abort fetch
-                    }
-                    return; // Exit generator
-                  }
-                  try {
-                    const parsedData: LLMGatewayEventData = JSON.parse(data);
-                    if (typeof parsedData === 'object' && parsedData !== null && 'type' in parsedData) {
-                        if (parsedData.type === 'text') { yield { type: 'text', data: parsedData.text }; }
-                        else if (parsedData.type === 'usage') { yield { type: 'usage', data: parsedData.usage }; }
-                        else { console.warn("Received unknown SSE event data type:", parsedData); }
-                    } else { console.warn("Received SSE data is not a valid JSON object with a 'type' field:", parsedData); }
-                  } catch (e) {
-                     console.error("Failed to parse SSE data JSON:", data, e);
-                     yield { type: 'error', data: new Error(`Failed to parse SSE JSON: ${e}`) };
-                  }
+          console.debug(
+            `>>> [LLMGatewayClient DEBUG] Processing message block: "${message.replace(
+              /\n/g,
+              "\\n"
+            )}"`
+          ); // *** ADDED LOG ***
+          const lines = message.split("\n");
+          for (const line of lines) {
+            if (line.startsWith("data:")) {
+              const dataStr = line.substring(5).trim();
+              console.debug(
+                `>>> [LLMGatewayClient DEBUG] Received data line: "${dataStr}"`
+              ); // *** ADDED LOG ***
+              if (dataStr === "[DONE]") {
+                console.info(
+                  ">>> [LLMGatewayClient INFO] SSE Stream [DONE] received."
+                ); // *** ADDED LOG ***
+                streamCancelled = true;
+                break;
               }
+              try {
+                const parsedJson = JSON.parse(dataStr);
+                // ... (rest of parsing logic with type guards) ...
+                if (
+                  typeof parsedJson === "object" &&
+                  parsedJson !== null &&
+                  "type" in parsedJson
+                ) {
+                  const parsedData = parsedJson as LLMGatewayRawEventData;
+                  if (parsedData.type === "text") {
+                    console.debug(
+                      ">>> [LLMGatewayClient DEBUG] Yielding text chunk."
+                    ); // *** ADDED LOG ***
+                    yield new ChatGenerationChunk({
+                      text: parsedData.text,
+                      message: new AIMessageChunk({ content: parsedData.text }),
+                    });
+                    await runManager?.handleLLMNewToken(parsedData.text);
+                  } else if (parsedData.type === "usage") {
+                    usageData = parsedData.usage;
+                    console.debug(
+                      ">>> [LLMGatewayClient DEBUG] Received usage data:",
+                      usageData
+                    ); // *** ADDED LOG ***
+                  } else {
+                    /* ... warn unknown type ... */
+                  }
+                } else {
+                  /* ... warn invalid format ... */
+                }
+              } catch (e) {
+                console.error(
+                  ">>> [LLMGatewayClient ERROR] Failed to parse SSE JSON:",
+                  dataStr,
+                  e
+                );
+              }
+            } else {
+              console.debug(
+                `>>> [LLMGatewayClient DEBUG] Skipping non-data line: "${line}"`
+              ); // *** ADDED LOG ***
             }
-         }
-         if (streamCancelled) break;
-      }
+          } // end for line loop
+          if (streamCancelled) break;
+        } // end while boundary loop
+        if (streamCancelled) break;
+      } // End chunk loop
 
-      // Check streamCancelled here - now in scope
-      if (!streamCancelled) {
-          if (buffer.trim()) { console.warn("Stream ended with unprocessed buffer content:", buffer); }
-          console.warn("SSE stream finished without explicit [DONE] marker.");
-          yield { type: 'done', data: null };
-      }
+      console.debug(
+        `>>> [LLMGatewayClient DEBUG] Finished processing stream chunks. Total chunks received: ${chunkCounter}. Stream cancelled: ${streamCancelled}`
+      ); // *** ADDED LOG ***
 
+      // Yield a final chunk with usage data if available
+      if (usageData) {
+        const usageChunk = new ChatGenerationChunk({
+          text: "",
+          message: new AIMessageChunk({
+            content: "",
+            additional_kwargs: { usage: usageData },
+          }),
+          generationInfo: {
+            tokenUsage: {
+              promptTokens: usageData.inputTokens || 0,
+              completionTokens: usageData.outputTokens || 0,
+              totalTokens:
+                (usageData.inputTokens || 0) + (usageData.outputTokens || 0),
+            },
+          },
+        });
+        yield usageChunk;
+      }
     } catch (error: any) {
-       // Check streamCancelled here - now in scope
-       if (error.name === 'AbortError') {
-            console.log("Stream fetch aborted.");
-            if (!streamCancelled) { // Only yield error if abort wasn't due to [DONE]
-                yield { type: 'error', data: new Error("Fetch aborted") };
-            }
-       } else {
-            console.error("Error during LLM stream processing:", error);
-            yield { type: 'error', data: error };
-       }
+      console.error(
+        ">>> [LLMGatewayClient ERROR] Error during LLM stream processing:",
+        error
+      ); // *** ADDED LOG ***
+      if (error.name === "AbortError" && !streamCancelled)
+        throw new Error("Fetch aborted");
+      else if (error.name !== "AbortError") throw error; // Re-throw other errors
     } finally {
-       console.debug("LLM Stream processing finished or errored.");
-       // Check streamCancelled here - now in scope
-       if (!signal.aborted && !streamCancelled) {
-            abortController.abort();
-       }
+      console.debug(
+        `>>> [LLMGatewayClient DEBUG] Stream processing 'finally' block. Signal aborted: ${signal.aborted}. Stream cancelled: ${streamCancelled}`
+      ); // *** ADDED LOG ***
+      if (!signal.aborted && !streamCancelled) {
+        console.debug(
+          ">>> [LLMGatewayClient DEBUG] Aborting fetch controller in finally block."
+        ); // *** ADDED LOG ***
+        abortController.abort();
+      }
     }
   }
 
-   // Helper function to combine AbortSignals (remains the same)
-   private abortSignalAny(signals: AbortSignal[]): AbortSignal {
+  /** Helper to combine AbortSignals */
+  private abortSignalAny(signals: AbortSignal[]): AbortSignal {
     const controller = new AbortController();
     for (const signal of signals) {
       if (signal.aborted) {
         controller.abort(signal.reason);
-        return controller.signal;
+        return controller.signal; // Return immediately if one is already aborted
       }
+      // Add event listener to abort the combined controller when any input signal aborts
       signal.addEventListener("abort", () => controller.abort(signal.reason), {
-        signal: controller.signal,
+        signal: controller.signal, // Use the controller's signal to clean up listener
       });
     }
+    // Corrected: Always return the controller's signal
     return controller.signal;
   }
 
-  // callLLM remains the same
-  public async callLLM(query: string, options: LLMGatewayClientOptions = {}): Promise<string> {
-    let fullText = '';
-    const stream = this.callLLMStream(query, options);
-    for await (const event of stream) {
-        if (event.type === 'text') { fullText += event.data; }
-        else if (event.type === 'error') {
-            if (event.data?.message === 'Fetch aborted') { console.warn("callLLM aborted."); return fullText; }
-            throw event.data instanceof Error ? event.data : new Error(String(event.data)); }
-        else if (event.type === 'done') { break; }
+  /**
+   * Method required by agents like createReactAgent to make tools available.
+   * Returns a new runnable instance bound with the tools.
+   */
+  bindTools(
+    tools: BindToolsInput[],
+    kwargs?: Partial<BaseChatModelCallOptions> | undefined
+  ): Runnable<
+    BaseLanguageModelInput,
+    AIMessageChunk,
+    BaseChatModelCallOptions
+  > {
+    // Leverage the base bind method to attach tool information.
+    // This doesn't change the core API call logic for this custom client,
+    // but satisfies the interface requirement for createReactAgent.
+    // The actual tool usage relies on the system prompt guiding the LLM.
+    console.log("LLMGatewayClient.bindTools called"); // Log for debugging
+    // We might want to format the tools for the LLM here if the gateway supported it,
+    // but currently, we rely on the system prompt in graph.ts.
+    const formattedTools = tools.map(convertToOpenAITool);
+    return this.bind({
+      ...kwargs,
+    });
+  }
+  // ------------------------------
+
+  // Implementation of withStructuredOutput that matches the BaseChatModel signature
+  withStructuredOutput<
+    RunOutput extends Record<string, any> = Record<string, any>
+  >(
+    outputSchema:
+      | Record<string, any>
+      | ZodType<RunOutput, ZodTypeDef, RunOutput>,
+    config?: StructuredOutputMethodOptions<false> | undefined
+  ): Runnable<BaseLanguageModelInput, RunOutput>;
+  withStructuredOutput<
+    RunOutput extends Record<string, any> = Record<string, any>
+  >(
+    outputSchema:
+      | Record<string, any>
+      | ZodType<RunOutput, ZodTypeDef, RunOutput>,
+    config?: StructuredOutputMethodOptions<true> | undefined
+  ): Runnable<BaseLanguageModelInput, { raw: BaseMessage; parsed: RunOutput }>;
+  withStructuredOutput<
+    RunOutput extends Record<string, any> = Record<string, any>
+  >(
+    outputSchema:
+      | Record<string, any>
+      | ZodType<RunOutput, ZodTypeDef, RunOutput>,
+    config?: StructuredOutputMethodOptions<boolean> | undefined
+  ) {
+    console.warn(
+      "LLMGatewayClient.withStructuredOutput called but not fully implemented."
+    );
+
+    if (config?.method === "jsonMode") {
+      throw new Error(
+        "This model does not support jsonMode for structured output"
+      );
     }
-    return fullText;
+
+    // Use the base implementation from BaseChatModel which uses bindTools internally
+    return super.withStructuredOutput(outputSchema, config as any);
   }
 }
