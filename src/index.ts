@@ -1,115 +1,120 @@
 // src/index.ts
-import 'dotenv/config'; // Load environment variables first
-import { HumanMessage, AIMessage } from '@langchain/core/messages';
-// Import the promise that resolves to the app
-import { appPromise, closeMcpClient } from './agent/graph';
+import 'dotenv/config';
+import { HumanMessage, AIMessage, BaseMessage } from '@langchain/core/messages';
+import { appPromise, closeMcpClient, AgentInput, AgentOutput } from './agent/graph';
 import { v4 as uuidv4 } from 'uuid';
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
-
-// Simple in-memory store (keep as is)
-const conversationThreads: Record<string, { messages: (HumanMessage | AIMessage)[] }> = {}; // Adjusted type slightly
+import { RunnableConfig } from '@langchain/core/runnables';
+import { MemorySaver } from "@langchain/langgraph";
 
 async function main() {
     console.log("Waiting for agent graph to compile...");
-    // --- Wait for the async graph creation to complete ---
-    const app = await appPromise;
+    const app = await appPromise; // app is a Runnable
     console.log("Agent graph ready.");
-    // --- End Change ---
 
-    console.log("LangGraph Custom ReAct Agent with MCP Tools");
+    const memory = new MemorySaver(); // In-memory checkpointer
+
+    // Removed: const appWithMemory = app.withConfig({ checkpointer: memory });
+    // We will try passing checkpointer via invoke config
+
+    console.log("LangGraph Standard ReAct Agent (Custom LLM Backend) with MCP Tools");
     console.log("Enter 'quit' to exit.");
 
     const rl = readline.createInterface({ input, output });
     let currentThreadId: string | null = null;
 
-    // Register cleanup handler for MCP client
+    // --- Cleanup Handler (remains the same) ---
     let closing = false;
     const cleanup = async () => {
-        if (!closing) {
+         if (!closing) {
              closing = true;
              console.log("\nShutting down agent and MCP client...");
-             rl.close(); // Close readline interface
-             await closeMcpClient(); // Close the MCP client
+             rl.close();
+             await closeMcpClient();
              console.log("Shutdown complete.");
              process.exit(0);
-        }
-    };
-
-    process.on('SIGINT', cleanup); // Handle Ctrl+C
-    process.on('SIGTERM', cleanup); // Handle termination signals
+         }
+     };
+    process.on('SIGINT', cleanup);
+    process.on('SIGTERM', cleanup);
+    // ------------------------------------
 
     while (true) {
-        const userInput = await rl.question(currentThreadId ? `User (Thread: ${currentThreadId}): ` : "User (New Thread): ");
+        const prompt = currentThreadId ? `User (Thread: ${currentThreadId.substring(0, 6)}...): ` : "User (New Thread): ";
+        // Corrected: Ensure userInput is defined here
+        const userInput = await rl.question(prompt); // <--- userInput is defined here
 
         if (userInput.toLowerCase() === 'quit') {
-            await cleanup(); // Ensure cleanup on quit
+            await cleanup();
             break;
         }
+        // Corrected: Check userInput after definition
+        if (!userInput.trim()) continue;
 
         if (!currentThreadId) {
             currentThreadId = uuidv4();
-            conversationThreads[currentThreadId] = { messages: [] };
             console.log(`Started new conversation thread: ${currentThreadId}`);
         }
 
-        const humanMessage = new HumanMessage(userInput);
-        const currentState = {
-            messages: [humanMessage],
-            threadId: currentThreadId,
-        };
+        // Corrected: Use the defined userInput variable
+        const agentInput: AgentInput = { messages: [new HumanMessage(userInput)] };
 
-        console.log("\nInvoking agent...");
+        // Config for the invoke call
+        const invokeConfig: RunnableConfig = {
+             configurable: {
+                 thread_id: currentThreadId,
+                 // Attempt: Pass checkpointer via configurable. Keys might vary.
+                 // Common patterns use 'checkpointer' or might be implicit via thread_id
+                 // If this specific key doesn't work, memory won't function correctly.
+                 checkpointer: memory,
+             },
+             recursionLimit: 100,
+         };
+
+        console.log(`\nInvoking agent for thread ${currentThreadId}...`);
         try {
-            const finalState = await app.invoke(currentState, { configurable: { thread_id: currentThreadId } });
+            const finalState: AgentOutput = await app.invoke(agentInput, invokeConfig);
 
-            const messages = finalState.messages;
-            const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
+            const allMessages = finalState.messages;
+            const lastMessage = allMessages.length > 0 ? allMessages[allMessages.length - 1] : null;
 
             if (lastMessage instanceof AIMessage) {
-                let responseContent = '';
-                 if (Array.isArray(lastMessage.content)) {
+                 let responseContent = '';
+                 if (Array.isArray(lastMessage.content)) { // Handle array content
                      responseContent = lastMessage.content
-                        .map((item: any) => typeof item === 'string' ? item : JSON.stringify(item))
-                        .join(' ');
+                         .map((item: any) => typeof item === 'string' ? item : JSON.stringify(item))
+                         .join('\n');
                  } else if (typeof lastMessage.content === 'string') {
                      responseContent = lastMessage.content;
                  }
 
-                 if (responseContent) {
-                    console.log(`\nAgent: ${responseContent}`);
+                 if (responseContent.trim()) {
+                     console.log(`\nAgent: ${responseContent}`);
                  } else if (lastMessage.tool_calls && lastMessage.tool_calls.length > 0) {
-                     // Log tool calls more informatively
-                     const toolNames = lastMessage.tool_calls.map(tc => tc.name).join(', ');
-                     console.log(`\nAgent: (Executed tool(s): ${toolNames}) - Waiting for next step or final answer.`);
+                      const toolNames = lastMessage.tool_calls.map(tc => tc.name).join(', ');
+                     console.log(`\nAgent: (Executed tool(s): ${toolNames})`);
                  } else {
-                     console.log("\nAgent: (No textual response generated)");
+                     console.log("\nAgent: (No textual response or tool call detected in final message)");
                  }
             } else {
-                console.log("\nAgent: (No AI message found in final state)");
-                console.log("Final State:", JSON.stringify(finalState, null, 2));
+                console.log("\nAgent: (Last message was not from AI)");
+                 if (lastMessage) console.log("Last Message:", JSON.stringify(lastMessage, null, 2));
+                 else console.log("Final State contained no messages.");
             }
-
-            // --- Optional: Persist history ---
-            // conversationThreads[currentThreadId].messages.push(humanMessage);
-            // if (lastMessage instanceof AIMessage) {
-            //    conversationThreads[currentThreadId].messages.push(lastMessage);
-            // }
-            // --- End Optional ---
 
         } catch (error) {
             console.error("\nError invoking agent:", error);
+            // Consider adding error message back to state via memory if needed
         }
         console.log("------------------------------------");
     }
 
-    // Fallback cleanup if loop exits unexpectedly
     await cleanup();
 }
 
 main().catch(async (err) => {
     console.error("Unhandled error during main execution:", err);
-    // Ensure MCP client is closed even on unhandled errors
     await closeMcpClient().catch(closeErr => console.error("Error closing MCP client during error handling:", closeErr));
     process.exit(1);
 });
