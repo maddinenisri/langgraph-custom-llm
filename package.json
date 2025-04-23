@@ -20,6 +20,8 @@
   "dependencies": {
     "@langchain/core": "^0.3.46",
     "@langchain/langgraph": "^0.2.65",
+    "@langchain/mcp-adapters": "^0.4.2",
+    "@modelcontextprotocol/sdk": "^1.10.2",
     "@types/node-fetch": "^2.6.12",
     "dotenv": "^16.5.0",
     "node-fetch": "^3.3.2",
