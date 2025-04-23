@@ -134,7 +134,7 @@ const writeFileTool = tool(
 // Use Tavily Search (requires TAVILY_API_KEY in .env)
 // Replace with your preferred search tool implementation if needed.
 const searchTool = process.env.TAVILY_API_KEY
-    ? new TavilySearch({ maxResults: 3 })
+    ? new TavilySearch({ maxResults: 3, tavilyApiKey: process.env.TAVILY_API_KEY })
     : tool(async () => "Search is unavailable. Please set TAVILY_API_KEY.", {
           name: "tavily_search_results_json", // Keep standard name if possible
           description: "A search engine. Useful for when you need to answer questions about current events. Input should be a search query.",

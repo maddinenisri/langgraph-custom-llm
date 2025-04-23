@@ -4,9 +4,7 @@ import { BaseMessage } from "@langchain/core/messages";
 import { createReactAgent } from "@langchain/langgraph/prebuilt";
 import { MultiServerMCPClient } from "@langchain/mcp-adapters";
 import { standardTools } from "./toolExecutor";
-import { AgentState } from "./state";
 import { LLMGatewayClient } from "../llm_client/LLMGatewayClient";
-// Corrected Import: Use StructuredToolInterface or a more general base type
 import { type StructuredToolInterface } from "@langchain/core/tools";
 
 // Load environment variables
