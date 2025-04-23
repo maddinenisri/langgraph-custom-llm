@@ -10,7 +10,6 @@ import {
   AIMessage,
   AIMessageChunk,
   BaseMessage,
-  HumanMessage,
   SystemMessage,
   ToolMessage,
 } from "@langchain/core/messages";
@@ -19,8 +18,6 @@ import { CallbackManagerForLLMRun } from "@langchain/core/callbacks/manager";
 import { v4 as uuidv4 } from "uuid";
 import fetch, { Response } from "node-fetch";
 import { type ToolCall } from "@langchain/core/messages/tool";
-// Import necessary types for bindTools
-import type { StructuredToolInterface } from "@langchain/core/tools";
 import type { Runnable } from "@langchain/core/runnables";
 import { ZodType, ZodTypeDef } from "zod";
 
@@ -193,7 +190,6 @@ export class LLMGatewayClient extends BaseChatModel {
     options: this["ParsedCallOptions"],
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
-    console.debug(">>> [LLMGatewayClient DEBUG] Entering _generate..."); // Log entry
     const stream = this._streamResponseChunks(messages, options, runManager);
     let aggregatedText = "";
     let usageData: any = null;
@@ -206,9 +202,6 @@ export class LLMGatewayClient extends BaseChatModel {
       }
       lastChunk = chunk;
     }
-    console.debug(
-      `>>> [LLMGatewayClient DEBUG] _generate: Stream finished. Aggregated Text Length: ${aggregatedText.length}`
-    ); // Log stream finish
 
     if (!lastChunk && !aggregatedText) {
       console.warn(
@@ -227,13 +220,6 @@ export class LLMGatewayClient extends BaseChatModel {
     }
 
     const { textResponse, toolCalls } = this.parseToolCalls(aggregatedText);
-    console.debug(
-      `>>> [LLMGatewayClient DEBUG] _generate: Parsed response - Text: "${textResponse.substring(
-        0,
-        100
-      )}...", Tool Calls:`,
-      toolCalls
-    ); // Log parsed result
 
     const finalMessage = new AIMessage({
       content: textResponse,
@@ -254,13 +240,6 @@ export class LLMGatewayClient extends BaseChatModel {
       llmOutput: { usage: usageData },
     };
 
-    // *** ADDED LOG: Log the final result being returned by _generate ***
-    console.debug(
-      ">>> [LLMGatewayClient DEBUG] _generate: Returning ChatResult:",
-      JSON.stringify(result, null, 2)
-    );
-    // *********************************************************************
-
     return result;
   }
 
@@ -272,17 +251,10 @@ export class LLMGatewayClient extends BaseChatModel {
   ): AsyncGenerator<ChatGenerationChunk> {
     // Format messages for the gateway
     const gatewayMessages = this.formatGatewayMessages(messages);
-    
-    // Log the original and formatted messages for debugging
-    console.debug(">>> [LLMGatewayClient DEBUG] Original messages count:", messages.length);
-    console.debug(">>> [LLMGatewayClient DEBUG] Formatted messages count:", gatewayMessages.length);
-    console.debug(">>> [LLMGatewayClient DEBUG] Formatted messages:",
-      JSON.stringify(gatewayMessages.map(m => ({role: m.role, contentLength: m.content?.length || 0})))
-    );
-    
     const temperature = this.defaultTemperature;
     const maxTokens = this.defaultMaxTokens;
     const stopSequences = options.stop;
+    console.log(JSON.stringify(options, null, 2)); // Log formatted messages
     // Use the default threadId instead of trying to access it from options.configurable
     const threadId = this.defaultThreadId ?? uuidv4(); // Generate a new UUID if not provided
     // Make threadId optional since we're using the default
@@ -312,19 +284,12 @@ export class LLMGatewayClient extends BaseChatModel {
     let streamCancelled = false;
 
     try {
-      console.debug(
-        ">>> [LLMGatewayClient DEBUG] Sending request to LLM Gateway:",
-        JSON.stringify(requestBody)
-      ); // Existing log
       response = await fetch(this.apiUrl, {
         method: "POST",
         headers,
         body: JSON.stringify(requestBody),
         signal,
       });
-      console.debug(
-        `>>> [LLMGatewayClient DEBUG] Fetch response received. Status: ${response.status}, OK: ${response.ok}`
-      ); // *** ADDED LOG ***
 
       if (!response.ok) {
         const errorBody = await response
@@ -346,62 +311,29 @@ export class LLMGatewayClient extends BaseChatModel {
       let buffer = "";
       let usageData: any = null;
 
-      console.debug(
-        ">>> [LLMGatewayClient DEBUG] Starting to process SSE stream..."
-      ); // *** ADDED LOG ***
       let chunkCounter = 0; // *** ADDED Counter ***
 
       for await (const chunk of response.body as any as AsyncIterable<Buffer>) {
         chunkCounter++; // *** INCREMENT Counter ***
-        console.debug(
-          `>>> [LLMGatewayClient DEBUG] Received raw chunk ${chunkCounter} (size: ${chunk?.byteLength}).`
-        ); // *** ADDED LOG ***
         if (streamCancelled) {
-          console.debug(
-            `>>> [LLMGatewayClient DEBUG] Stream cancelled, breaking chunk loop.`
-          ); // *** ADDED LOG ***
           break;
         }
 
         buffer += decoder.decode(chunk, { stream: true });
-        console.debug(
-          `>>> [LLMGatewayClient DEBUG] Current buffer (partial): "${buffer
-            .replace(/\n/g, "\\n")
-            .substring(0, 200)}..."`
-        ); // *** ADDED LOG ***
 
         let boundaryIndex;
         while ((boundaryIndex = buffer.indexOf("\n\n")) >= 0) {
-          console.debug(
-            `>>> [LLMGatewayClient DEBUG] Found message boundary at index ${boundaryIndex}.`
-          ); // *** ADDED LOG ***
           if (streamCancelled) break;
           const message = buffer.substring(0, boundaryIndex);
           buffer = buffer.substring(boundaryIndex + 2);
           if (!message.trim()) {
-            console.debug(
-              ">>> [LLMGatewayClient DEBUG] Skipping empty message block."
-            ); // *** ADDED LOG ***
             continue;
           }
-
-          console.debug(
-            `>>> [LLMGatewayClient DEBUG] Processing message block: "${message.replace(
-              /\n/g,
-              "\\n"
-            )}"`
-          ); // *** ADDED LOG ***
           const lines = message.split("\n");
           for (const line of lines) {
             if (line.startsWith("data:")) {
               const dataStr = line.substring(5).trim();
-              console.debug(
-                `>>> [LLMGatewayClient DEBUG] Received data line: "${dataStr}"`
-              ); // *** ADDED LOG ***
               if (dataStr === "[DONE]") {
-                console.info(
-                  ">>> [LLMGatewayClient INFO] SSE Stream [DONE] received."
-                ); // *** ADDED LOG ***
                 streamCancelled = true;
                 break;
               }
@@ -415,9 +347,6 @@ export class LLMGatewayClient extends BaseChatModel {
                 ) {
                   const parsedData = parsedJson as LLMGatewayRawEventData;
                   if (parsedData.type === "text") {
-                    console.debug(
-                      ">>> [LLMGatewayClient DEBUG] Yielding text chunk."
-                    ); // *** ADDED LOG ***
                     yield new ChatGenerationChunk({
                       text: parsedData.text,
                       message: new AIMessageChunk({ content: parsedData.text }),
@@ -425,10 +354,6 @@ export class LLMGatewayClient extends BaseChatModel {
                     await runManager?.handleLLMNewToken(parsedData.text);
                   } else if (parsedData.type === "usage") {
                     usageData = parsedData.usage;
-                    console.debug(
-                      ">>> [LLMGatewayClient DEBUG] Received usage data:",
-                      usageData
-                    ); // *** ADDED LOG ***
                   } else {
                     /* ... warn unknown type ... */
                   }
@@ -452,10 +377,6 @@ export class LLMGatewayClient extends BaseChatModel {
         } // end while boundary loop
         if (streamCancelled) break;
       } // End chunk loop
-
-      console.debug(
-        `>>> [LLMGatewayClient DEBUG] Finished processing stream chunks. Total chunks received: ${chunkCounter}. Stream cancelled: ${streamCancelled}`
-      ); // *** ADDED LOG ***
 
       // Yield a final chunk with usage data if available
       if (usageData) {
@@ -485,13 +406,7 @@ export class LLMGatewayClient extends BaseChatModel {
         throw new Error("Fetch aborted");
       else if (error.name !== "AbortError") throw error; // Re-throw other errors
     } finally {
-      console.debug(
-        `>>> [LLMGatewayClient DEBUG] Stream processing 'finally' block. Signal aborted: ${signal.aborted}. Stream cancelled: ${streamCancelled}`
-      ); // *** ADDED LOG ***
       if (!signal.aborted && !streamCancelled) {
-        console.debug(
-          ">>> [LLMGatewayClient DEBUG] Aborting fetch controller in finally block."
-        ); // *** ADDED LOG ***
         abortController.abort();
       }
     }
